@@ -1,0 +1,19 @@
+[project]
+name = "twigt"
+version = "0.1.0"
+description = "Task trees on the command line: tasks with a body, tags and a status, moved as whole branches"
+readme = "README.md"
+authors = [
+    { name = "Manuel M.", email = "manuel.muth@rosiris.de" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
