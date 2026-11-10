@@ -1,17 +1,17 @@
-"""Trees as box-drawn text: one line per task with its number, title and
-tags, the status marks lined up in one column; ≡ marks a task with a body."""
+"""Trees as box-drawn text: one line per task with its outline number,
+title and tags, the status marks lined up in one column; ≡ marks a task
+with a body."""
 
 from __future__ import annotations
 
 import datetime
 from collections.abc import Callable
 
-from twigt.tasks import Data, Place, Task, is_open, show_ref, walk
+from twigt.tasks import Data, Path, Place, Task, is_open, show_ref, walk
 
 MARKS = {
     "open": "🔲 open",
     "active": "▶ in progress",
-    "you": "⏸ you",
     "waiting": "⏳ waiting",
     "done": "✅ done",
     "dropped": "❌ dropped",
@@ -36,9 +36,14 @@ def day(stamp: str) -> str:
     return f"{moment.day} {moment:%b}{year}"
 
 
-def label(task: Task, body_mark: bool = True) -> str:
+def number(path: Path) -> str:
+    return ".".join(map(str, path))
+
+
+def label(task: Task, name: str, body_mark: bool = True) -> str:
+    """name (the tree id or the outline number), title, tags, body mark."""
     tags = f' [{", ".join(task["tags"])}]' if task["tags"] else ""
-    return f'{task["id"]} {task["title"]}{tags}{" ≡" if task["body"] and body_mark else ""}'
+    return f'{name} {task["title"]}{tags}{" ≡" if task["body"] and body_mark else ""}'
 
 
 def matcher(open_only: bool = False, tag: str | None = None) -> Filter:
@@ -53,16 +58,17 @@ def matcher(open_only: bool = False, tag: str | None = None) -> Filter:
 Row = tuple[str, str | None]  # (left, mark); a body line has no mark
 
 
-def branch_rows(tasks: list[Task], indent: str, shown: Filter, bodies: bool) -> list[Row]:
+def branch_rows(tasks: list[Task], prefix: Path, indent: str, shown: Filter, bodies: bool) -> list[Row]:
     rows: list[Row] = []
     visible = [task for task in tasks if shown(task)]
     for index, task in enumerate(visible):
         last = index == len(visible) - 1
-        rows.append((f'{indent}{"└─" if last else "├─"} {label(task)}', mark(task)))
+        path = prefix + (task["id"],)
+        rows.append((f'{indent}{"└─" if last else "├─"} {label(task, number(path))}', mark(task)))
         inner = indent + ("   " if last else "│  ")
         if bodies:
             rows += body_rows(task, inner, shown)
-        rows += branch_rows(task["tasks"], inner, shown, bodies)
+        rows += branch_rows(task["tasks"], path, inner, shown, bodies)
     return rows
 
 
@@ -77,12 +83,12 @@ def lay_out(rows: list[Row]) -> list[str]:
 
 
 def tree(root: Task, shown: Filter | None = None, bodies: bool = False) -> str:
-    """A whole tree: the root's line carries the day it was started."""
+    """A whole tree: the root's line carries its id and the day it was started."""
     shown = shown or matcher()
-    rows: list[Row] = [(f'{label(root)} · {day(root["created"])}', mark(root))]
+    rows: list[Row] = [(f'{label(root, str(root["id"]))} · {day(root["created"])}', mark(root))]
     if bodies:
         rows += body_rows(root, "", shown)
-    rows += branch_rows(root["tasks"], "", shown, bodies)
+    rows += branch_rows(root["tasks"], (), "", shown, bodies)
     return "\n".join(lay_out(rows))
 
 
@@ -90,13 +96,15 @@ def detail(place: Place, shown: Filter | None = None, bodies: bool = False) -> s
     """One task in full: its line with its tree, where it is, its body, then its branch."""
     shown = shown or matcher()
     task = place.task
-    head = show_ref(place.ref) + label(task, body_mark=False).removeprefix(str(task["id"]))
-    parts = ["\n".join(lay_out([(head, mark(task))]))]
+    parts = ["\n".join(lay_out([(label(task, show_ref(place.ref), body_mark=False), mark(task))]))]
     if place.ancestors:
-        parts[0] += "\nin " + " › ".join(f'{above["id"]} {above["title"]}' for above in place.ancestors)
+        tree, *above = place.ancestors
+        names = [f'{tree["id"]} {tree["title"]}']
+        names += [f'{number(place.path[: depth + 1])} {task_above["title"]}' for depth, task_above in enumerate(above)]
+        parts[0] += "\nin " + " › ".join(names)
     if task["body"]:
         parts.append(task["body"])
-    children = branch_rows(task["tasks"], "", shown, bodies)
+    children = branch_rows(task["tasks"], place.path, "", shown, bodies)
     if children:
         parts.append("\n".join(lay_out(children)))
     return "\n\n".join(parts)

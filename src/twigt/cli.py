@@ -15,7 +15,7 @@ from pathlib import Path
 
 from twigt import render, tasks
 from twigt.store import Store, default_folder
-from twigt.tasks import Data, Mapping, Problem, Ref, Spec, Task, show_ref
+from twigt.tasks import Data, Moved, Problem, Ref, Spec, Task, show_ref
 
 STATUS_VERBS = {
     "start": "active",
@@ -23,14 +23,13 @@ STATUS_VERBS = {
     "drop": "dropped",
     "reopen": "open",
     "wait": "waiting",
-    "you": "you",
 }
 
 EPILOG = """\
-A task is its tree's id and its number, kemi:5; a tree alone is kemi.
-An outline (on stdin for new and add) is one task per line, nested by
-indentation; "title | status: note" sets a status: open, active (in
-progress), you (waits on you), waiting (on something else), done, dropped."""
+A task is its tree's id and its outline number, kemi:6.2.1; a tree alone
+is kemi. An outline (on stdin for new and add) is one task per line,
+nested by indentation; "title | status: note" sets a status: open,
+active (in progress), waiting, done, dropped."""
 
 
 def ref(text: str) -> Ref:
@@ -79,10 +78,11 @@ def trees(data: Data, refs: list[Ref]) -> str:
     return "\n\n".join(render.tree(root) for root in roots.values())
 
 
-def renumbered(mapping: Mapping) -> str:
-    if not mapping:
+def renumbered(moved: Moved, what: str = "Renumbered") -> str:
+    """old → new for each task whose number changed; its sub-tasks follow it."""
+    if not moved:
         return ""
-    return "Renumbered: " + ", ".join(f"{show_ref(old)} → {show_ref(new)}" for old, new in mapping.items()) + ".\n\n"
+    return f"{what}: " + ", ".join(f"{show_ref(old)} → {show_ref(new)}" for old, new in moved) + ".\n\n"
 
 
 def cmd_show(store: Store, args: argparse.Namespace) -> str:
@@ -102,7 +102,7 @@ def cmd_new(store: Store, args: argparse.Namespace) -> str:
     children = [] if args.body == "-" else outline_from_stdin()
     with store.change() as data:
         tree = tasks.new_tree(data, Spec(args.title, tasks=tuple(children)), body or "", args.tag)
-        tasks.focus(data, args.ctx, (tree["id"], None))
+        tasks.focus(data, args.ctx, (tree["id"], ()))
         return render.tree(tree)
 
 
@@ -120,10 +120,7 @@ def cmd_add(store: Store, args: argparse.Namespace) -> str:
             raise Problem("nothing to add: give a title, or an outline on stdin")
     with store.change() as data:
         parent = tasks.locate(data, args.under) if args.under is not None else tasks.focused(data, args.ctx)
-        new = [tasks.make(data, parent.tree, spec, body or "", args.tag) for spec in specs]
-        parent.task["tasks"].extend(new)
-        tree_id = parent.tree["id"]
-        added = ", ".join(show_ref((tree_id, task["id"])) for task in new)
+        added = ", ".join(map(show_ref, tasks.add(data, parent, specs, body or "", args.tag)))
         return f"Added {added} under {show_ref(parent.ref)}.\n\n" + render.tree(parent.tree)
 
 
@@ -151,27 +148,24 @@ def cmd_status(store: Store, args: argparse.Namespace) -> str:
 def cmd_move(store: Store, args: argparse.Namespace) -> str:
     with store.change() as data:
         before = tasks.locate(data, args.ref).tree
-        mapping: Mapping = {}
-        if args.command == "up":
-            tasks.move_up(data, args.ref)
-        elif args.command == "down":
-            tasks.move_down(data, args.ref)
+        if args.command in ("up", "down"):
+            moved = tasks.swap(data, args.ref, -1 if args.command == "up" else 1)
         elif args.command == "in":
-            tasks.indent(data, args.ref)
+            moved = tasks.indent(data, args.ref)
         elif args.command == "out":
-            mapping = tasks.outdent(data, args.ref)
+            moved = tasks.outdent(data, args.ref)
         elif args.root:
-            mapping = tasks.make_tree(data, args.ref)
+            moved = tasks.make_tree(data, args.ref)
         else:
-            mapping = tasks.move_under(data, args.ref, args.under)
-        now = mapping.get(args.ref, args.ref)
+            moved = tasks.move_under(data, args.ref, args.under)
+        now = moved[0][1]
         after = tasks.locate(data, now).tree
-        if now[1] is None and after is not before:
+        if not now[1] and after is not before:
             tasks.attach(data, args.ctx, now)  # a new tree: the context's
         shown = [after]
         if after is not before and any(root is before for root in data["trees"]):
             shown.append(before)  # out of one tree into another: both changed
-        return renumbered(mapping) + "\n\n".join(render.tree(root) for root in shown)
+        return renumbered(moved, "Moved") + "\n\n".join(render.tree(root) for root in shown)
 
 
 def cmd_tag(store: Store, args: argparse.Namespace) -> str:
@@ -189,25 +183,25 @@ def cmd_delete(store: Store, args: argparse.Namespace) -> str:
             with_them = f" with its {below} sub-task{'s' if below > 1 else ''}" if below else ""
             lines.append(f"Deleted {show_ref(each)}{with_them}; `twigt restore {show_ref(each)}` brings it back.")
             if not tasks.is_tree(entry["task"]) and tasks.find_tree(data, entry["tree"]):
-                left.append((entry["tree"], None))
+                left.append((entry["tree"], ()))
         return "\n".join(lines) + ("\n\n" + trees(data, left) if left else "")
 
 
 def cmd_restore(store: Store, args: argparse.Namespace) -> str:
     with store.change() as data:
-        task, mapping = tasks.restore(data, args.ref)
-        now = mapping.get(args.ref, args.ref)
+        task, moved = tasks.restore(data, args.ref)
+        now = moved[0][1] if moved else args.ref
         head = ""
-        if now[1] is None and args.ref[1] is not None:
+        if not now[1] and args.ref[1]:
             tasks.attach(data, args.ctx, now)
             head = f"{show_ref(args.ref)} was under a task that is gone: it is a tree of its own now.\n"
-        return head + renumbered(mapping) + trees(data, [now])
+        return head + renumbered(moved) + trees(data, [now])
 
 
 def cmd_renumber(store: Store, args: argparse.Namespace) -> str:
     with store.change() as data:
-        mapping = tasks.renumber(data, args.ref)
-        return (renumbered(mapping) or "Numbered 1, 2, 3 … already.\n\n") + trees(data, [args.ref])
+        moved = tasks.renumber(data, args.ref)
+        return (renumbered(moved) or "Numbered 1, 2, 3 … already.\n\n") + trees(data, [args.ref])
 
 
 def cmd_focus(store: Store, args: argparse.Namespace) -> str:
@@ -259,13 +253,13 @@ def parser() -> argparse.ArgumentParser:
         return commands.add_parser(name, help=text, description=text[0].upper() + text[1:] + ".")
 
     def one(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("ref", type=ref, metavar="TASK", help="kemi:5, or a tree: kemi")
+        parser.add_argument("ref", type=ref, metavar="TASK", help="kemi:6.2, or a tree: kemi")
 
     def several(parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("refs", nargs="+", type=ref, metavar="TASK", help="kemi:5, or a tree: kemi")
+        parser.add_argument("refs", nargs="+", type=ref, metavar="TASK", help="kemi:6.2, or a tree: kemi")
 
     show = command("show", "the context's trees and a line per other tree; with TASK, that task in full")
-    show.add_argument("ref", nargs="?", type=ref, metavar="TASK", help="kemi:5, or a tree: kemi")
+    show.add_argument("ref", nargs="?", type=ref, metavar="TASK", help="kemi:6.2, or a tree: kemi")
     show.add_argument("--all", action="store_true", help="every tree in full")
     show.add_argument("--closed", action="store_true", help="closed trees too")
     show.add_argument("--open", action="store_true", help="only open tasks, and the tasks above them")
@@ -291,25 +285,24 @@ def parser() -> argparse.ArgumentParser:
         ("done", "mark done, with the open tasks below"),
         ("drop", "mark dropped (won't be done), with the open tasks below"),
         ("reopen", "mark open again"),
-        ("wait", "mark waiting on something else; the note says on what"),
-        ("you", "mark waiting on you; the note says for what"),
+        ("wait", "mark waiting; the note says on what or whom"),
     ):
         status = command(verb, text)
         several(status)
         status.add_argument("-n", "--note", help="what came of it, or what it waits for")
 
     for move, text in (
-        ("up", "move above the task before it"),
-        ("down", "move below the task after it"),
-        ("in", "move under the task above it, as its last sub-task"),
-        ("out", "move next to its parent, after it; from a tree's top level, a tree of its own"),
+        ("up", "swap place and number with the task before it"),
+        ("down", "swap place and number with the task after it"),
+        ("in", "move to the end of the task above it"),
+        ("out", "move to the end of its parent's level; from a tree's top level, a tree of its own"),
     ):
         one(command(move, text))
-    mv = command("mv", "move under any task, in any tree (renumbered there), or make it a tree of its own")
+    mv = command("mv", "move to the end of any task, in any tree, or make it a tree of its own")
     one(mv)
     where = mv.add_mutually_exclusive_group(required=True)
     where.add_argument("-u", "--under", type=ref, metavar="TASK")
-    where.add_argument("--root", action="store_true", help="a tree of its own, numbered from 1")
+    where.add_argument("--root", action="store_true", help="a tree of its own")
 
     for name, text in (("tag", "add tags"), ("untag", "remove tags")):
         tagging = command(name, text)
@@ -318,7 +311,7 @@ def parser() -> argparse.ArgumentParser:
 
     several(command("delete", "take tasks out, with everything below; restore brings them back"))
     one(command("restore", "put a deleted task back where it was"))
-    one(command("renumber", "number a tree's tasks 1, 2, 3 … top to bottom, closing the gaps"))
+    one(command("renumber", "number every level of a tree 1, 2, 3 …, closing the gaps"))
     one(command("focus", "make TASK the one add puts new tasks under"))
     one(command("attach", "make TASK's tree one of the context's trees"))
     return main
@@ -333,5 +326,9 @@ def main(argv: list[str] | None = None) -> None:
         args = parser().parse_args([*argv, "show"])
     try:
         print(COMMANDS[args.command](Store(args.data or default_folder()), args))
+        sys.stdout.flush()
     except Problem as problem:
         sys.exit(f"twigt: {problem}")
+    except BrokenPipeError:  # the reader stopped early, as `twigt | head` does
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
