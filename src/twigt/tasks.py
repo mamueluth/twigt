@@ -1,17 +1,23 @@
-"""The task forest and every change to it.
+"""The task trees and every change to them.
 
-A tree is a task without a parent. Every task has a number that never
-changes and is never reused, so moving a branch keeps references to it
-("see 43") valid. Deleted branches are kept, with where they were, until
-restored. Contexts (a shell, a chat) each keep their trees and a focus:
-the task `add` puts new tasks under."""
+Each tree has an id of its own, a pronounceable word made from a hash of
+its title and the time it was made (`kemi`), and numbers its tasks from 1.
+A task is always its tree and number: `kemi:5`. Moving a branch within its
+tree keeps the numbers; a branch that becomes a tree of its own is
+numbered from 1 again, one moved into another tree gets that tree's next
+numbers, and `renumber` closes the gaps deleting leaves.
+
+Behind the numbers, every task has a key that never changes. Where a
+deleted branch was and a context's trees and focus hold keys, so they stay
+true through every move and renumbering."""
 
 from __future__ import annotations
 
 import datetime
+import hashlib
 import re
-from collections.abc import Iterable, Iterator
-from typing import NamedTuple, TypedDict
+from collections.abc import Callable, Iterable, Iterator
+from typing import NamedTuple, NotRequired, TypedDict
 
 STATUSES = ("open", "active", "you", "waiting", "done", "dropped")
 CLOSED = frozenset({"done", "dropped"})
@@ -23,7 +29,9 @@ class Problem(Exception):
 
 
 class Task(TypedDict):
-    id: int
+    key: int  # never changes, never shown
+    id: int | str  # a task's number in its tree; a tree's id
+    next: NotRequired[int]  # trees only: the number the next task gets
     title: str
     body: str
     status: str
@@ -36,22 +44,24 @@ class Task(TypedDict):
 
 class Deleted(TypedDict):
     task: Task
-    parent: int | None  # None: it was a tree
+    tree: str  # the tree it was in (a deleted tree: its own id), for `restore kemi:5`
+    parent: int | None  # the parent's key; None: it was a tree
     index: int
     deleted: str
 
 
 class Context(TypedDict):
-    trees: list[int]  # the tasks it attached; shown as the trees they're in, latest first
-    focus: int | None
+    trees: list[int]  # keys of tasks; shown as the trees they're in now, latest first
+    focus: int | None  # a key
 
 
 class Data(TypedDict):
     format: int
-    next: int
+    key: int  # the key the next task gets
     trees: list[Task]
     deleted: list[Deleted]
     contexts: dict[str, Context]
+    used: list[str]  # every tree id ever given out
 
 
 class Spec(NamedTuple):
@@ -63,15 +73,24 @@ class Spec(NamedTuple):
     tasks: tuple[Spec, ...] = ()
 
 
+Ref = tuple[str, int | None]  # (tree, number); no number: the tree itself
+Mapping = dict[Ref, Ref]  # old ref -> new ref, for the tasks a change renumbered
+
+
 class Place(NamedTuple):
     siblings: list[Task]
     index: int
-    parent: Task | None
+    parent: Task | None  # None: the task is a tree
     ancestors: list[Task]  # the tree first, the parent last
+    tree: Task
 
     @property
     def task(self) -> Task:
         return self.siblings[self.index]
+
+    @property
+    def ref(self) -> Ref:
+        return (self.tree["id"], None if self.parent is None else self.task["id"])
 
 
 def now() -> str:
@@ -79,7 +98,7 @@ def now() -> str:
 
 
 def empty() -> Data:
-    return {"format": FORMAT, "next": 1, "trees": [], "deleted": [], "contexts": {}}
+    return {"format": FORMAT, "key": 1, "trees": [], "deleted": [], "contexts": {}, "used": []}
 
 
 def walk(tasks: Iterable[Task]) -> Iterator[Task]:
@@ -92,32 +111,108 @@ def is_open(task: Task) -> bool:
     return task["status"] not in CLOSED
 
 
-def locate(data: Data, number: int) -> Place:
-    def search(siblings: list[Task], parent: Task | None, ancestors: list[Task]) -> Place | None:
+def is_tree(task: Task) -> bool:
+    return isinstance(task["id"], str)
+
+
+REF = re.compile(r"([a-z]+)(?::(\d+)?)?")
+
+
+def parse_ref(text: str) -> Ref:
+    match = REF.fullmatch(text.strip().lower())
+    if not match:
+        raise Problem(f"{text!r} isn't a task or tree: write kemi:5 for a task, kemi for a tree")
+    return match[1], int(match[2]) if match[2] else None
+
+
+def show_ref(ref: Ref) -> str:
+    tree, number = ref
+    return tree if number is None else f"{tree}:{number}"
+
+
+CONSONANTS = "bdfghjklmnprstvz"
+VOWELS = "aeiou"
+
+
+def fresh_id(data: Data, title: str) -> str:
+    """Syllables from a hash of the title and the time: two, or more where
+    the shorter ones are taken. An id is never given out twice."""
+    digest = hashlib.sha256(f"{title}\n{now()}".encode()).digest()
+    syllables = [CONSONANTS[byte >> 4] + VOWELS[byte % 5] for byte in digest]
+    for length in range(2, len(syllables) + 1):
+        candidate = "".join(syllables[:length])
+        if candidate not in data["used"]:
+            data["used"].append(candidate)
+            return candidate
+    raise Problem("no free tree id")  # 32 syllables all taken: can't happen
+
+
+def find_tree(data: Data, tree_id: str) -> Task | None:
+    return next((tree for tree in data["trees"] if tree["id"] == tree_id), None)
+
+
+def search(trees: list[Task], wanted: Callable[[Task], bool]) -> Place | None:
+    """The place of the first task wanted(task) is true for, trees first."""
+    for index, tree in enumerate(trees):
+        if wanted(tree):
+            return Place(trees, index, None, [], tree)
+
+    def inside(siblings: list[Task], parent: Task, ancestors: list[Task]) -> Place | None:
         for index, task in enumerate(siblings):
-            if task["id"] == number:
-                return Place(siblings, index, parent, ancestors)
-            found = search(task["tasks"], task, ancestors + [task])
+            if wanted(task):
+                return Place(siblings, index, parent, ancestors, ancestors[0])
+            found = inside(task["tasks"], task, ancestors + [task])
             if found:
                 return found
         return None
 
-    place = search(data["trees"], None, [])
+    for tree in trees:
+        found = inside(tree["tasks"], tree, [tree])
+        if found:
+            return found
+    return None
+
+
+def by_key(data: Data, key: int) -> Place | None:
+    return search(data["trees"], lambda task: task["key"] == key)
+
+
+def locate(data: Data, ref: Ref) -> Place:
+    tree_id, number = ref
+    tree = find_tree(data, tree_id)
+    place = None
+    if tree is not None and number is None:
+        place = Place(data["trees"], data["trees"].index(tree), None, [], tree)
+    elif tree is not None:
+        place = search([tree], lambda task: task["id"] == number)
     if place is None:
-        for entry in data["deleted"]:
-            if any(task["id"] == number for task in walk([entry["task"]])):
-                raise Problem(f"{number} is deleted: `twigt restore {entry['task']['id']}` brings it back")
-        raise Problem(f"no task {number}")
+        found = deleted_entry(data, ref)
+        if found:
+            raise Problem(f"{show_ref(ref)} is deleted: `twigt restore {show_ref(entry_ref(found[0]))}` brings it back")
+        raise Problem(f"no tree {tree_id}" if tree is None else f"no task {show_ref(ref)}")
     return place
 
 
-def get(data: Data, number: int) -> Task:
-    return locate(data, number).task
+def get(data: Data, ref: Ref) -> Task:
+    return locate(data, ref).task
 
 
-def tree_of(data: Data, number: int) -> Task:
-    place = locate(data, number)
-    return place.ancestors[0] if place.ancestors else place.task
+def entry_ref(entry: Deleted) -> Ref:
+    task = entry["task"]
+    return (task["id"], None) if is_tree(task) else (entry["tree"], task["id"])
+
+
+def deleted_entry(data: Data, ref: Ref) -> tuple[Deleted, bool] | None:
+    """The deleted branch ref is in, and whether ref is that branch's top."""
+    tree_id, number = ref
+    for entry in data["deleted"]:
+        if entry_ref(entry)[0] != tree_id:
+            continue
+        if entry_ref(entry) == ref:
+            return entry, True
+        if number is not None and any(sub["id"] == number for sub in walk(entry["task"]["tasks"])):
+            return entry, False
+    return None
 
 
 TAG = re.compile(r"^[^\s\[\],]+$")
@@ -136,11 +231,11 @@ def check_tag(tag: str) -> str:
     return tag
 
 
-def make(data: Data, spec: Spec, body: str = "", tags: Iterable[str] = ()) -> Task:
-    """A new task and its sub-tasks, numbered on from the last number given out."""
+def blank(data: Data, spec: Spec, body: str, tags: Iterable[str]) -> Task:
     stamp = now()
     task: Task = {
-        "id": data["next"],
+        "key": data["key"],
+        "id": 0,
         "title": check_title(spec.title),
         "body": body.strip("\n"),
         "status": spec.status,
@@ -150,9 +245,26 @@ def make(data: Data, spec: Spec, body: str = "", tags: Iterable[str] = ()) -> Ta
         "updated": stamp,
         "tasks": [],
     }
-    data["next"] += 1
-    task["tasks"] = [make(data, child) for child in spec.tasks]
+    data["key"] += 1
     return task
+
+
+def make(data: Data, tree: Task, spec: Spec, body: str = "", tags: Iterable[str] = ()) -> Task:
+    """A new task and its sub-tasks, numbered on in tree."""
+    task = blank(data, spec, body, tags)
+    task["id"] = tree["next"]
+    tree["next"] += 1
+    task["tasks"] = [make(data, tree, child) for child in spec.tasks]
+    return task
+
+
+def new_tree(data: Data, spec: Spec, body: str = "", tags: Iterable[str] = ()) -> Task:
+    tree = blank(data, spec, body, tags)
+    tree["id"] = fresh_id(data, spec.title)
+    tree["next"] = 1
+    tree["tasks"] = [make(data, tree, child) for child in spec.tasks]
+    data["trees"].append(tree)
+    return tree
 
 
 OUTLINE_STATUS = re.compile(r"\s+\|\s+(" + "|".join(STATUSES) + r")(?::\s*(.*))?$")
@@ -190,24 +302,25 @@ def touch(task: Task) -> None:
     task["updated"] = now()
 
 
-def set_status(data: Data, numbers: Iterable[int], status: str, note: str) -> list[int]:
+def set_status(data: Data, refs: Iterable[Ref], status: str, note: str) -> list[Ref]:
     """Set the named tasks' status and note. Closing (done, dropped) also
     closes their open sub-tasks, without a note. Returns every task changed."""
     changed = []
-    for number in numbers:
-        named = get(data, number)
+    for ref in refs:
+        place = locate(data, ref)
+        named = place.task
         targets = [named]
         if status in CLOSED:
             targets += [task for task in walk(named["tasks"]) if is_open(task)]
         for task in targets:
             task["status"], task["note"] = status, note if task is named else ""
             touch(task)
-            changed.append(task["id"])
+            changed.append(place.ref if task is named else (place.tree["id"], task["id"]))
     return changed
 
 
-def edit(data: Data, number: int, title: str | None, body: str | None) -> Task:
-    task = get(data, number)
+def edit(data: Data, ref: Ref, title: str | None, body: str | None) -> Task:
+    task = get(data, ref)
     if title is not None:
         task["title"] = check_title(title)
     if body is not None:
@@ -216,8 +329,8 @@ def edit(data: Data, number: int, title: str | None, body: str | None) -> Task:
     return task
 
 
-def tag(data: Data, number: int, tags: Iterable[str]) -> Task:
-    task = get(data, number)
+def tag(data: Data, ref: Ref, tags: Iterable[str]) -> Task:
+    task = get(data, ref)
     for name in tags:
         if check_tag(name) not in task["tags"]:
             task["tags"].append(name)
@@ -225,102 +338,166 @@ def tag(data: Data, number: int, tags: Iterable[str]) -> Task:
     return task
 
 
-def untag(data: Data, number: int, tags: Iterable[str]) -> Task:
-    task = get(data, number)
+def untag(data: Data, ref: Ref, tags: Iterable[str]) -> Task:
+    task = get(data, ref)
     for name in tags:
         if name not in task["tags"]:
-            raise Problem(f"{number} has no tag {name!r}")
+            raise Problem(f"{show_ref(ref)} has no tag {name!r}")
         task["tags"].remove(name)
     touch(task)
     return task
 
 
+# Numbering.
+
+
+def into_tree(task: Task, tree: Task, old_tree: str, mapping: Mapping) -> None:
+    """task and its branch get tree's next numbers; a tree becomes a task."""
+    old = (old_tree, None if is_tree(task) else task["id"])
+    task.pop("next", None)
+    task["id"] = tree["next"]
+    tree["next"] += 1
+    mapping[old] = (tree["id"], task["id"])
+    for sub in task["tasks"]:
+        into_tree(sub, tree, old_tree, mapping)
+
+
+def as_tree(data: Data, task: Task, old_tree: str) -> Mapping:
+    """task becomes a tree of its own, its branch numbered from 1."""
+    old: Ref = (old_tree, task["id"])
+    task["id"] = fresh_id(data, task["title"])
+    task["next"] = 1
+    mapping: Mapping = {old: (task["id"], None)}
+    for sub in task["tasks"]:
+        into_tree(sub, task, old_tree, mapping)
+    data["trees"].append(task)
+    return mapping
+
+
+def renumber(data: Data, ref: Ref) -> Mapping:
+    """The tree's tasks numbered 1, 2, 3 … top to bottom, as shown."""
+    place = locate(data, ref)
+    if place.parent is not None:
+        raise Problem(f"renumber takes a tree: {place.tree['id']}, not {show_ref(ref)}")
+    tree = place.tree
+    tree["next"] = 1
+    mapping: Mapping = {}
+    for task in walk(tree["tasks"]):
+        old = task["id"]
+        task["id"] = tree["next"]
+        tree["next"] += 1
+        if old != task["id"]:
+            mapping[(tree["id"], old)] = (tree["id"], task["id"])
+    return mapping
+
+
 # Moves. A task always moves with its whole branch.
 
 
-def move_up(data: Data, number: int) -> None:
-    place = locate(data, number)
+def movable(place: Place, ref: Ref, what: str) -> None:
+    if place.parent is None:
+        raise Problem(f"{show_ref(ref)} is a tree: {what} moves tasks within a tree")
+
+
+def move_up(data: Data, ref: Ref) -> None:
+    place = locate(data, ref)
+    movable(place, ref, "up")
     if place.index == 0:
-        raise Problem(f"{number} is first already")
+        raise Problem(f"{show_ref(ref)} is first already")
     siblings, index = place.siblings, place.index
     siblings[index - 1], siblings[index] = siblings[index], siblings[index - 1]
 
 
-def move_down(data: Data, number: int) -> None:
-    place = locate(data, number)
+def move_down(data: Data, ref: Ref) -> None:
+    place = locate(data, ref)
+    movable(place, ref, "down")
     if place.index == len(place.siblings) - 1:
-        raise Problem(f"{number} is last already")
+        raise Problem(f"{show_ref(ref)} is last already")
     siblings, index = place.siblings, place.index
     siblings[index + 1], siblings[index] = siblings[index], siblings[index + 1]
 
 
-def indent(data: Data, number: int) -> None:
+def indent(data: Data, ref: Ref) -> None:
     """Under the task above it, as its last sub-task."""
-    place = locate(data, number)
+    place = locate(data, ref)
+    movable(place, ref, "in")
     if place.index == 0:
-        raise Problem(f"{number} has no task above it to go under")
+        raise Problem(f"{show_ref(ref)} has no task above it to go under")
     task = place.siblings.pop(place.index)
     place.siblings[place.index - 1]["tasks"].append(task)
 
 
-def outdent(data: Data, number: int) -> bool:
-    """Next to its parent, right after it. Returns whether it became a tree."""
-    place = locate(data, number)
+def outdent(data: Data, ref: Ref) -> Mapping:
+    """Next to its parent, right after it; from a tree's top level, a tree
+    of its own. Returns the renumbering, if any."""
+    place = locate(data, ref)
     if place.parent is None:
-        raise Problem(f"{number} is a tree already")
-    parent = locate(data, place.parent["id"])
+        raise Problem(f"{show_ref(ref)} is a tree already")
+    if place.parent is place.tree:
+        return make_tree(data, ref)
+    parent = by_key(data, place.parent["key"])
     parent.siblings.insert(parent.index + 1, place.siblings.pop(place.index))
-    return parent.parent is None
+    return {}
 
 
-def move_under(data: Data, number: int, target: int) -> None:
-    """Under target, as its last sub-task; target may be in another tree."""
-    place = locate(data, number)
-    if any(task["id"] == target for task in walk([place.task])):
-        raise Problem(f"{target} is in {number}'s branch: a branch can't go under itself")
-    destination = get(data, target)
-    destination["tasks"].append(place.siblings.pop(place.index))
+def move_under(data: Data, ref: Ref, target: Ref) -> Mapping:
+    """Under target, as its last sub-task. Within the tree the numbers stay;
+    into another tree the branch gets that tree's next numbers."""
+    place = locate(data, ref)
+    destination = locate(data, target)
+    if any(task is destination.task for task in walk([place.task])):
+        raise Problem(f"{show_ref(target)} is in {show_ref(ref)}'s branch: a branch can't go under itself")
+    task = place.siblings.pop(place.index)
+    destination.task["tasks"].append(task)
+    mapping: Mapping = {}
+    if destination.tree is not place.tree:
+        into_tree(task, destination.tree, place.tree["id"], mapping)
+    return mapping
 
 
-def make_tree(data: Data, number: int) -> None:
-    place = locate(data, number)
+def make_tree(data: Data, ref: Ref) -> Mapping:
+    place = locate(data, ref)
     if place.parent is None:
-        raise Problem(f"{number} is a tree already")
-    data["trees"].append(place.siblings.pop(place.index))
+        raise Problem(f"{show_ref(ref)} is a tree already")
+    return as_tree(data, place.siblings.pop(place.index), place.tree["id"])
 
 
-def delete(data: Data, number: int) -> Deleted:
-    place = locate(data, number)
-    entry: Deleted = {
-        "task": place.siblings.pop(place.index),
-        "parent": place.parent["id"] if place.parent else None,
-        "index": place.index,
-        "deleted": now(),
-    }
+def delete(data: Data, ref: Ref) -> Deleted:
+    place = locate(data, ref)
+    task = place.siblings.pop(place.index)
+    parent = None if place.parent is None else place.parent["key"]
+    entry: Deleted = {"task": task, "tree": place.tree["id"], "parent": parent, "index": place.index, "deleted": now()}
     data["deleted"].append(entry)
     return entry
 
 
-def restore(data: Data, number: int) -> tuple[Task, bool]:
-    """Back where it was. Returns the task and whether its parent was gone,
-    which makes it a tree of its own."""
-    entry = next((entry for entry in reversed(data["deleted"]) if entry["task"]["id"] == number), None)
-    if entry is None:
-        for other in data["deleted"]:
-            if any(task["id"] == number for task in walk([other["task"]])):
-                raise Problem(f"{number} was deleted with {other['task']['id']}: restore {other['task']['id']}")
-        raise Problem(f"{number} isn't deleted")
+def restore(data: Data, ref: Ref) -> tuple[Task, Mapping]:
+    """Back under the task it was under, wherever that is now, with its
+    numbers where they're free in that tree, else that tree's next ones.
+    With that task gone, a tree of its own."""
+    found = deleted_entry(data, ref)
+    if found is None:
+        raise Problem(f"{show_ref(ref)} isn't deleted")
+    entry, top = found
+    if not top:
+        raise Problem(f"{show_ref(ref)} was deleted with {show_ref(entry_ref(entry))}: restore that")
     data["deleted"].remove(entry)
-    parent = None
-    if entry["parent"] is not None:
-        try:
-            parent = get(data, entry["parent"])
-        except Problem:
-            parent = None
-    siblings = parent["tasks"] if parent else data["trees"]
-    index = entry["index"] if parent or entry["parent"] is None else len(siblings)
-    siblings.insert(min(index, len(siblings)), entry["task"])
-    return entry["task"], entry["parent"] is not None and parent is None
+    task = entry["task"]
+    if is_tree(task):
+        data["trees"].insert(min(entry["index"], len(data["trees"])), task)
+        return task, {}
+    parent = by_key(data, entry["parent"])
+    if parent is None:
+        return task, as_tree(data, task, entry["tree"])
+    tree, mapping = parent.tree, {}
+    numbers = {sub["id"] for sub in walk([task])}
+    taken = {other["id"] for other in walk(tree["tasks"])}
+    parent.task["tasks"].insert(min(entry["index"], len(parent.task["tasks"])), task)
+    if tree["id"] != entry["tree"] or taken & numbers:
+        into_tree(task, tree, entry["tree"], mapping)
+    else:
+        tree["next"] = max(tree["next"], max(numbers) + 1)
+    return task, mapping
 
 
 # Contexts.
@@ -330,37 +507,35 @@ def context(data: Data, name: str) -> Context:
     return data["contexts"].setdefault(name, {"trees": [], "focus": None})
 
 
-def attach(data: Data, name: str, number: int) -> None:
-    """Make the tree number is in one of the context's trees, its latest."""
+def attach(data: Data, name: str, ref: Ref) -> None:
+    """Make ref's tree one of the context's trees, its latest."""
+    key = locate(data, ref).tree["key"]
     trees = context(data, name)["trees"]
-    if number in trees:
-        trees.remove(number)
-    trees.insert(0, get(data, number)["id"])
+    if key in trees:
+        trees.remove(key)
+    trees.insert(0, key)
 
 
-def focus(data: Data, name: str, number: int) -> None:
-    attach(data, name, number)
-    context(data, name)["focus"] = number
+def focus(data: Data, name: str, ref: Ref) -> None:
+    attach(data, name, ref)
+    context(data, name)["focus"] = get(data, ref)["key"]
 
 
-def focused(data: Data, name: str) -> Task:
-    number = data["contexts"].get(name, {}).get("focus")
-    if number is None:
-        raise Problem('nothing in focus: start a tree with `twigt new "title"`, pick a task with `twigt focus N`, or add with -u N')
-    try:
-        return get(data, number)
-    except Problem as problem:
-        raise Problem(f"the focus is gone ({problem}); pick a task with `twigt focus N`, or add with -u N") from None
+def focused(data: Data, name: str) -> Place:
+    key = data["contexts"].get(name, {}).get("focus")
+    place = None if key is None else by_key(data, key)
+    if place is None:
+        gone = "" if key is None else "the task in focus is deleted; "
+        raise Problem(f'{gone}nothing in focus: start a tree with `twigt new "title"`, pick a task with `twigt focus kemi:5`, or add with -u')
+    return place
 
 
 def trees_of(data: Data, name: str) -> list[Task]:
-    """The trees the context's tasks are in now, latest first; a task that
-    moved into another tree brings that tree, a deleted one nothing."""
-    trees: dict[int, Task] = {}
-    for number in data["contexts"].get(name, {}).get("trees", []):
-        try:
-            tree = tree_of(data, number)
-        except Problem:
-            continue
-        trees.setdefault(tree["id"], tree)
+    """The trees the context's tasks are in now, latest first: a tree moved
+    into another brings that one, a deleted one nothing."""
+    trees: dict[str, Task] = {}
+    for key in data["contexts"].get(name, {}).get("trees", []):
+        place = by_key(data, key)
+        if place is not None:
+            trees.setdefault(place.tree["id"], place.tree)
     return list(trees.values())

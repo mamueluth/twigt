@@ -6,7 +6,7 @@ from __future__ import annotations
 import datetime
 from collections.abc import Callable
 
-from twigt.tasks import Data, Task, is_open, walk
+from twigt.tasks import Data, Place, Task, is_open, show_ref, walk
 
 MARKS = {
     "open": "🔲 open",
@@ -36,9 +36,9 @@ def day(stamp: str) -> str:
     return f"{moment.day} {moment:%b}{year}"
 
 
-def label(task: Task) -> str:
+def label(task: Task, body_mark: bool = True) -> str:
     tags = f' [{", ".join(task["tags"])}]' if task["tags"] else ""
-    return f'{task["id"]} {task["title"]}{tags}{" ≡" if task["body"] else ""}'
+    return f'{task["id"]} {task["title"]}{tags}{" ≡" if task["body"] and body_mark else ""}'
 
 
 def matcher(open_only: bool = False, tag: str | None = None) -> Filter:
@@ -86,12 +86,14 @@ def tree(root: Task, shown: Filter | None = None, bodies: bool = False) -> str:
     return "\n".join(lay_out(rows))
 
 
-def detail(task: Task, ancestors: list[Task], shown: Filter | None = None, bodies: bool = False) -> str:
-    """One task in full: its line, where it is, its body, then its branch."""
+def detail(place: Place, shown: Filter | None = None, bodies: bool = False) -> str:
+    """One task in full: its line with its tree, where it is, its body, then its branch."""
     shown = shown or matcher()
-    parts = ["\n".join(lay_out([(label(task).removesuffix(" ≡"), mark(task))]))]
-    if ancestors:
-        parts[0] += "\nin " + " › ".join(f'{above["id"]} {above["title"]}' for above in ancestors)
+    task = place.task
+    head = show_ref(place.ref) + label(task, body_mark=False).removeprefix(str(task["id"]))
+    parts = ["\n".join(lay_out([(head, mark(task))]))]
+    if place.ancestors:
+        parts[0] += "\nin " + " › ".join(f'{above["id"]} {above["title"]}' for above in place.ancestors)
     if task["body"]:
         parts.append(task["body"])
     children = branch_rows(task["tasks"], "", shown, bodies)
